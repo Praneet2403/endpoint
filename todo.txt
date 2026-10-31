@@ -9,5 +9,8 @@
 - feat: make a request call without saving the request
 - feat: define role and access while invite the workspace 
 
+technical difficulty: 
 technical dificulty : subscribewithselector  in zustand, it was rerendering issue in websocket,
 Parsing, nad serialization of a lot thing like header and body
+
+also tech the full workflow and architectural flow of it like how does the data do what, like mostly the request run thing.
