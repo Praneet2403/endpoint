@@ -1,121 +1,274 @@
-# Endpoint – Architecture Overview
+# Endpoint — Architecture & Data Flow
 
-> A Postman-like REST API testing tool built with Next.js App Router, Prisma, PostgreSQL, Zustand, and TanStack Query.
+Endpoint is a Postman-style API client: workspaces, collections, saved HTTP requests, server-side proxy execution, response history, WebSocket testing, and AI-assisted naming and JSON body generation.
 
----
+## High-Level Technical Architecture
 
-## Tech Stack
+```mermaid
+flowchart TB
+    subgraph Client["Browser (React 19)"]
+        UI[UI Components<br/>shadcn / Radix / Tailwind]
+        ZS[Zustand Stores<br/>tabs, workspace, WebSocket]
+        RQ[TanStack React Query<br/>mutations & cache]
+    end
 
-| Layer | Technology |
-|---|---|
-| Framework | Next.js 14 (App Router) |
-| Language | TypeScript |
-| Database | PostgreSQL (via Docker) |
-| ORM | Prisma |
-| Auth | Better Auth |
-| HTTP Client | Axios (server-side, inside Server Actions) |
-| Client State | Zustand |
-| Server State / Caching | TanStack React Query |
-| UI | shadcn/ui + Tailwind CSS |
-| Code Editor | Monaco Editor |
-| Validation | Zod + React Hook Form |
+    subgraph NextApp["Next.js 16 App Router"]
+        Pages[Workspace Pages<br/>/ and /ws]
+        SA[Server Actions<br/>requests, collections, workspace]
+        API[Route Handlers<br/>/api/auth, /api/ai/*]
+        AuthLib[Better Auth]
+        AI[AI Agents<br/>Vercel AI SDK + Gemini]
+    end
 
----
+    subgraph Data["Persistence"]
+        PG[(PostgreSQL<br/>Docker)]
+        Prisma[Prisma ORM]
+    end
 
-## Project Structure
+    subgraph External["External Services"]
+        TargetAPI[Target REST APIs]
+        OAuth[GitHub / Google OAuth]
+        Gemini[Google Generative AI]
+        WSServer[WebSocket Servers]
+    end
 
-```
-src/
-├── app/
-│   ├── (auth)/            # Sign-in page
-│   └── (workspace)/       # Main app page (authenticated)
-│       └── page.tsx       # Root layout: ResizablePanel(Playground | Sidebar)
-├── actions/               # Next.js Server Actions (direct DB + Axios calls)
-│   ├── requests/index.ts  # CRUD + sendRequest + run
-│   ├── collections/       # Collection CRUD
-│   ├── workspace/         # Workspace CRUD
-│   └── authentication/    # currentUser helper
-├── hooks/                 # TanStack Query wrappers (mutations + queries)
-│   ├── requests/
-│   ├── collections/
-│   └── workspace/
-├── store/                 # Zustand stores (ephemeral UI state)
-│   ├── request/useRequestStore.ts   # Tabs, active tab, response data
-│   └── workspaces/useWorkspaceStore.ts
-├── components/
-│   ├── requests/          # RequestPlayground, TabBar, RequestBar, RequestEditorArea
-│   ├── response/          # ResponseViewer, BodyEditor, KeyValueFormEditor
-│   ├── collections/       # Sidebar, CollectionFolder, CRUD modals
-│   └── workspace/         # Workspace switcher
-├── lib/
-│   ├── db.ts              # Prisma singleton
-│   ├── auth.ts            # Better Auth server config
-│   └── auth-client.ts     # Better Auth browser client
-└── providers/             # ReactQuery, Theme, HotKey providers
+    UI --> ZS
+    UI --> RQ
+    RQ --> SA
+    RQ --> API
+    Pages --> UI
+    SA --> Prisma
+    API --> AI
+    AuthLib --> Prisma
+    Prisma --> PG
+    SA -->|axios proxy| TargetAPI
+    AuthLib --> OAuth
+    AI --> Gemini
+    ZS -->|native WebSocket| WSServer
 ```
 
----
+## Layered Architecture
 
-## Database Schema
+```mermaid
+flowchart LR
+    subgraph Presentation
+        A[Request Playground]
+        B[Collections Sidebar]
+        C[WebSocket Panel]
+        D[Monaco Body Editor]
+    end
 
+    subgraph State
+        E[useRequestPlaygroundStore]
+        F[useWorkspaceStore]
+        G[useWsStore]
+    end
+
+    subgraph Application
+        H[React Query Hooks]
+        I[Server Actions]
+        J[API Routes]
+    end
+
+    subgraph Domain
+        K[Workspace / Collection / Request]
+        L[RequestRun history]
+    end
+
+    subgraph Infrastructure
+        M[Prisma + Postgres]
+        N[Axios HTTP client]
+        O[Better Auth sessions]
+    end
+
+    A --> E
+    B --> H
+    C --> G
+    D --> A
+    H --> I
+    H --> J
+    I --> K
+    I --> N
+    K --> M
+    I --> L
+    O --> M
 ```
-User ──< Session
-User ──< Account
-User ──< WorkspaceMember >── Workspace
-Workspace ──< Collection ──< Request ──< RequestRun (1:1, latest only)
+
+## HTTP Request Execution Data Flow
+
+This is the core “Send” path: the browser never calls the target API directly; the server action proxies the call and persists the result.
+
+```mermaid
+sequenceDiagram
+    actor User
+    participant RB as RequestBar (Client)
+    participant Hook as useRunRequest
+    participant Run as run() Server Action
+    participant DB as PostgreSQL
+    participant Axios as Axios (Server)
+    participant API as External API
+    participant Store as Zustand
+    participant RV as ResponseViewer
+
+    User->>RB: Click Send
+    RB->>Hook: mutateAsync()
+    Hook->>Run: run(requestId)
+    Run->>DB: findUnique(Request)
+    Run->>Axios: sendRequest(method, url, headers, body, params)
+    Axios->>API: HTTP request
+    API-->>Axios: response
+    Axios-->>Run: status, headers, body, durationMs
+    Run->>DB: upsert RequestRun
+    Run->>DB: update Request.response (on success)
+    Run-->>Hook: { success, requestRun, response }
+    Hook->>Store: setResponseViewerData(data)
+    Store->>RV: render status, body, timing
 ```
 
-### Key Models
+## CRUD & Collection Data Flow
 
-```prisma
-model Request {
-  id           String      @id @default(cuid())
-  name         String
-  method       REST_METHOD @default(GET)   // GET|POST|PUT|DELETE|PATCH
-  url          String
-  parameters   String?     // JSON string: [{key, value, enabled}]
-  headers      String?     // JSON string: [{key, value, enabled}]
-  body         String?     // raw body string (JSON or plain text)
-  response     String?     // last successful response body as string
-  collectionId String
-  runs         RequestRun[]
-}
+```mermaid
+sequenceDiagram
+    actor User
+    participant UI as Playground / Modals
+    participant RQ as React Query
+    participant SA as Server Actions
+    participant DB as PostgreSQL
 
-model RequestRun {
-  id         String   @id @default(cuid())
-  requestId  String   @unique          // 1:1 — only latest run is kept
-  status     Int                       // HTTP status code (0 = failed)
-  statusText String?
-  headers    Json?                     // response headers as JSON object
-  body       Json?                     // response body as JSON
-  durationMs Int?
-}
+    User->>UI: Save request (Cmd+S)
+    UI->>RQ: useSaveRequest / useAddRequestToCollection
+    RQ->>SA: saveRequest / addRequestToCollection
+    SA->>DB: create or update Request
+    SA-->>RQ: saved Request
+    RQ->>UI: invalidate ["requests"] + sync tab from DB
+
+    User->>UI: Open collection item
+    UI->>RQ: useGetRequests(collectionId)
+    RQ->>SA: getRequests
+    SA->>DB: findMany by collectionId
+    SA-->>UI: list of requests
+    UI->>UI: openRequestTab() in Zustand
 ```
-
-> **Important:** `parameters`, `headers`, and `body` on `Request` are stored as **JSON strings** (not native JSON columns). They are serialized/deserialized manually in the app. `RequestRun.headers` and `RequestRun.body` are native `Json` Prisma columns.
-
----
-
-## State Management Split
-
-| Concern | Tool | Why |
-|---|---|---|
-| Open tabs, active tab, in-flight edits | Zustand (`useRequestPlaygroundStore`) | Ephemeral, no server round-trip needed |
-| Latest response data for the viewer | Zustand (`responseViewerData`) | Needs to survive re-renders, not persisted |
-| Selected workspace | Zustand (`useWorkspaceStore`) | Global UI selection |
-| Collections list, requests list | TanStack Query | Cached, auto-invalidated on mutations |
-| Running/saving a request | TanStack Query mutation | Loading states, error toast, cache invalidation |
-
----
 
 ## Authentication Flow
 
-Better Auth handles session management. `currentUser()` (a Server Action helper) reads the session from the request and returns the authenticated user. All workspace/collection actions call `currentUser()` before touching the DB.
+```mermaid
+sequenceDiagram
+    actor User
+    participant SignIn as /sign-in
+    participant AuthAPI as /api/auth/[...all]
+    participant BA as Better Auth
+    participant DB as PostgreSQL
 
----
+    User->>SignIn: GitHub or Google
+    SignIn->>AuthAPI: OAuth callback
+    AuthAPI->>BA: session + account
+    BA->>DB: User, Session, Account
 
-## Planned Extensions
+    Note over SignIn,DB: Dev mode: currentUser() returns first DB user without session
 
-The architecture is designed to add:
-- **WebSocket testing** – a new tab type and a different execution path (not Axios)
-- **AI SDK integration** – a new tab type that routes through an AI provider
+    User->>SignIn: Enter workspace
+    SignIn->>BA: getSession (production)
+    BA->>DB: validate session
+```
+
+## AI Assistance Data Flow
+
+```mermaid
+sequenceDiagram
+    actor User
+    participant Modal as Rename / Body Editor
+    participant Hook as useAiSuggestion hooks
+    participant Route as /api/ai/*
+    participant Agent as ai-agents.ts
+    participant Gemini as Gemini 3.1 Flash Lite
+
+    User->>Modal: Suggest name or generate JSON
+    Modal->>Hook: POST with context
+    Hook->>Route: suggest-name | generate-body | generate-json
+    Route->>Agent: generateObject (Zod schema)
+    Agent->>Gemini: structured output
+    Gemini-->>Agent: suggestions / JSON body
+    Agent-->>Modal: apply to tab or editor
+```
+
+## WebSocket Testing Flow (Client-Side Only)
+
+```mermaid
+sequenceDiagram
+    actor User
+    participant Bar as ConnectionBar
+    participant WS as useWsStore (Zustand)
+    participant Socket as Browser WebSocket
+    participant Server as Remote WS Server
+    participant Log as Message Log Table
+
+    User->>Bar: Enter ws:// URL + Connect
+    Bar->>WS: connect(url)
+    WS->>Socket: new WebSocket(url)
+    Socket->>Server: handshake
+    Server-->>Socket: open
+    User->>Bar: Send message
+    WS->>Socket: send(payload)
+    Socket->>Server: frame
+    Server-->>Socket: message
+    WS->>Log: addMessage(received)
+```
+
+## Entity Relationship (Data Model)
+
+```mermaid
+erDiagram
+    User ||--o{ Workspace : owns
+    User ||--o{ WorkspaceMember : joins
+    Workspace ||--o{ WorkspaceMember : has
+    Workspace ||--o{ Collection : contains
+    Collection ||--o{ Request : contains
+    Request ||--o| RequestRun : "latest run"
+    User ||--o{ Session : has
+    User ||--o{ Account : has
+
+    User {
+        string id PK
+        string email
+        string name
+    }
+    Workspace {
+        string id PK
+        string name
+        string ownerId FK
+    }
+    Collection {
+        string id PK
+        string name
+        string workspaceId FK
+    }
+    Request {
+        string id PK
+        string method
+        string url
+        string headers
+        string body
+        string parameters
+        string response
+    }
+    RequestRun {
+        string id PK
+        int status
+        json headers
+        json body
+        int durationMs
+    }
+```
+
+## App Routes Map
+
+| Route | Purpose |
+|-------|---------|
+| `/sign-in` | OAuth login (GitHub, Google) |
+| `/` | REST playground + collections sidebar |
+| `/ws` | WebSocket client tester |
+| `/api/auth/[...all]` | Better Auth handler |
+| `/api/ai/suggest-name` | AI request naming |
+| `/api/ai/generate-body` | AI JSON body generation |
+| `/api/ai/generate-json` | AI JSON utilities |
